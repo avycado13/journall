@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 eframe = "0.37.0"
 gray_matter = "0.3.2"
-jiff = "1.0.0"
+jiff = {version = "1.0.0", features = ["serde"] }
 markdown = "1.0.0"
 serde = "1.0.229"
 url = "2.5.8"
