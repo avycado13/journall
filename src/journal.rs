@@ -108,7 +108,12 @@ impl Journal {
     }
 
     pub fn journal_to_markdown(&self) -> Result<String, Box<dyn std::error::Error>> {
-        nodes_to_markdown(&self.journal_to_nodes()?)
+        let nodes = self.journal_to_nodes()?;
+        let Node::Yaml(frontmatter) = &nodes[0] else {
+            unreachable!("journal_to_nodes always starts with frontmatter")
+        };
+        let body = nodes_to_markdown(&nodes[1..])?;
+        Ok(format!("---\n{}---\n\n{body}", frontmatter.value))
     }
 
     pub fn journal_to_nodes(&self) -> Result<Vec<Node>, Box<dyn std::error::Error>> {
@@ -212,6 +217,59 @@ mod tests {
         assert!(matches!(nodes[1], Node::Heading(_)));
         assert!(nodes.iter().any(|node| matches!(node, Node::Paragraph(_))));
         assert!(nodes.iter().any(|node| matches!(node, Node::List(_))));
+    }
+
+    #[test]
+    fn parse_requires_valid_frontmatter() {
+        for input in [
+            "# 2026-06-08 - Entry\n",
+            "---\ntitle: Journal\n---\n\n# 2026-06-08 - Entry\n",
+            "---\ntitle: Journal\ngithub_repo: example/repo\ndescription: Notes\ncreated_at: invalid\n---\n",
+        ] {
+            assert!(
+                Journal::parse(input).is_err(),
+                "accepted invalid input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_ignores_content_before_first_entry_and_keeps_empty_entries() {
+        let input = "---\ntitle: Journal\ngithub_repo: example/repo\ndescription: Notes\ncreated_at: 2026-06-01\n---\n\nIntro paragraph.\n\n# 2026-06-08 - First\n# 2026-06-09 - Second\n\nBody text.\n";
+        let journal = Journal::parse(input).unwrap();
+        assert_eq!(journal.created_at, date(2026, 6, 1));
+        assert_eq!(journal.entries.len(), 2);
+        assert!(journal.entries[0].content.is_empty());
+        let body = nodes_to_markdown(&journal.entries[1].content).unwrap();
+        assert!(body.contains("Body text."));
+        assert!(!body.contains("Intro paragraph."));
+    }
+
+    #[test]
+    fn markdown_round_trip_preserves_metadata_entries_and_body() {
+        let input = "---\ntitle: Journal\ngithub_repo: example/repo\ndescription: Notes\ncreated_at: 2026-06-01\n---\n\n# 2026-06-08 - First - milestone\n\nA **bold** paragraph.\n\n## Details\n\n- one\n- two\n\n# 2026-06-09 - Second\n\nFinal note.\n";
+        let journal = Journal::parse(input).unwrap();
+        let markdown = journal.journal_to_markdown().unwrap();
+        let reparsed = Journal::parse(&markdown).unwrap();
+        assert_eq!(reparsed.title, journal.title);
+        assert_eq!(reparsed.github_repo, journal.github_repo);
+        assert_eq!(reparsed.description, journal.description);
+        assert_eq!(reparsed.created_at, journal.created_at);
+        assert_eq!(reparsed.entries.len(), 2);
+        for (before, after) in journal.entries.iter().zip(&reparsed.entries) {
+            assert_eq!(after.date, before.date);
+            assert_eq!(after.title, before.title);
+            assert_eq!(
+                nodes_to_markdown(&after.content).unwrap(),
+                nodes_to_markdown(&before.content).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_entry_date_fails_to_parse_journal() {
+        let input = "---\ntitle: Journal\ngithub_repo: example/repo\ndescription: Notes\ncreated_at: 2026-06-01\n---\n\n# not-a-date - Entry\n";
+        assert!(Journal::parse(input).is_err());
     }
 
     #[test]
