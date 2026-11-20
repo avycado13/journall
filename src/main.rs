@@ -1,4 +1,5 @@
 use eframe::egui;
+use journall::journal::Journal;
 
 pub struct JournallApp {}
 

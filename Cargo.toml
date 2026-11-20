@@ -8,5 +8,7 @@ eframe = "0.37.0"
 gray_matter = "0.3.2"
 jiff = {version = "1.0.0", features = ["serde"] }
 markdown = "1.0.0"
+mdast_util_to_markdown = "0.0.2"
 serde = "1.0.229"
 url = "2.5.8"
+yaml_serde = "0.10.7"
