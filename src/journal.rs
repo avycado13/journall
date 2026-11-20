@@ -1,13 +1,12 @@
-use gray_matter::engine::YAML;
 use gray_matter::Matter;
+use gray_matter::engine::YAML;
 use jiff::ZonedDateTime;
-use jiff::{civil::Date, Span};
+use jiff::{Span, civil::Date};
 use markdown::mdast::{Node, Root};
 use markdown::{Constructs, ParseOptions};
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
-use url::Url;
 
 #[derive(Debug, serde::Serialize)]
 pub struct Journal {
@@ -31,7 +30,7 @@ pub struct Entry {
 
 #[derive(Debug)]
 pub struct Image {
-    pub url: Url,
+    pub url: String,
     pub alt_text: String,
 }
 
@@ -78,12 +77,14 @@ impl Journal {
             for node in children {
                 if matches!(node, Node::Heading(heading) if heading.depth == 1) {
                     if let Some((date, title)) = header.take() {
+                        let time_spent = extract_time_spent(&body)?;
+                        let images = extract_images(&body)?;
                         journal.entries.push(Entry {
                             date,
                             title,
                             content: std::mem::take(&mut body),
-                            images: Vec::new(),
-                            time_spent: Span::new(),
+                            images,
+                            time_spent,
                         });
                     }
                     header = Some(parse_entry_header(
@@ -96,12 +97,14 @@ impl Journal {
             }
         }
         if let Some((date, title)) = header {
+            let time_spent = extract_time_spent(&body)?;
+            let images = extract_images(&body)?;
             journal.entries.push(Entry {
                 date,
                 title,
                 content: body,
-                images: Vec::new(),
-                time_spent: Span::new(),
+                images,
+                time_spent,
             });
         }
         Ok(journal)
@@ -123,15 +126,7 @@ impl Journal {
             position: None,
         }));
         for entry in self.entries.iter() {
-            ast.push(Node::Heading(markdown::mdast::Heading {
-                children: vec![Node::Text(markdown::mdast::Text {
-                    value: format_entry_header(&entry.date, &entry.title),
-                    position: None,
-                })],
-                position: None,
-                depth: 1,
-            }));
-            ast.extend(entry.content.iter().cloned());
+            ast.extend(entry.entry_to_nodes()?);
         }
         Ok(ast)
     }
@@ -144,6 +139,59 @@ impl Journal {
 impl Entry {
     pub fn add_image(&mut self, image: Image) {
         self.images.push(image);
+    }
+    pub fn entry_to_nodes(&self) -> Result<Vec<Node>, Box<dyn std::error::Error>> {
+        let mut ast: Vec<Node> = Vec::new();
+        ast.push(Node::Heading(markdown::mdast::Heading {
+            children: vec![Node::Text(markdown::mdast::Text {
+                value: format_entry_header(&self.date, &self.title),
+                position: None,
+            })],
+            position: None,
+            depth: 1,
+        }));
+        ast.extend(self.content.iter().cloned());
+        // Parsed entries already contain their time-spent paragraph.
+        let has_time_spent = self.content.iter().any(|node| {
+            matches!(node, Node::Paragraph(paragraph) if paragraph.children.iter().any(|child| {
+                matches!(child, Node::Strong(_))
+                    && extract_text(child)
+                        .trim()
+                        .to_ascii_lowercase()
+                        .starts_with("total time spent")
+            }))
+        });
+        if !has_time_spent && self.time_spent.fieldwise() != Span::new().fieldwise() {
+            ast.push(Node::Paragraph(markdown::mdast::Paragraph {
+                children: vec![Node::Strong(markdown::mdast::Strong {
+                    children: vec![Node::Text(markdown::mdast::Text {
+                        value: format!("Total time spent: {:#}", self.time_spent),
+                        position: None,
+                    })],
+                    position: None,
+                })],
+                position: None,
+            }));
+        }
+        let existing_images = extract_images(&self.content)?;
+        for image in &self.images {
+            if existing_images
+                .iter()
+                .any(|existing| existing.url == image.url && existing.alt_text == image.alt_text)
+            {
+                continue;
+            }
+            ast.push(Node::Paragraph(markdown::mdast::Paragraph {
+                children: vec![Node::Image(markdown::mdast::Image {
+                    url: image.url.clone(),
+                    alt: image.alt_text.clone(),
+                    title: None,
+                    position: None,
+                })],
+                position: None,
+            }));
+        }
+        Ok(ast)
     }
 }
 
@@ -188,10 +236,151 @@ fn extract_text(node: &Node) -> String {
     text
 }
 
+fn extract_images(nodes: &[Node]) -> Result<Vec<Image>, Box<dyn std::error::Error>> {
+    let mut images = Vec::new();
+    for node in nodes {
+        if let Node::Image(image) = node {
+            images.push(Image {
+                url: image.url.clone(),
+                alt_text: image.alt.clone(),
+            });
+        }
+        if let Some(children) = node.children() {
+            images.extend(extract_images(children)?);
+        }
+    }
+    Ok(images)
+}
+
+fn extract_time_spent(nodes: &[Node]) -> Result<Span, Box<dyn std::error::Error>> {
+    for node in nodes {
+        let Node::Paragraph(paragraph) = node else {
+            continue;
+        };
+        for (index, child) in paragraph.children.iter().enumerate() {
+            let Node::Strong(_) = child else {
+                continue;
+            };
+            let bold_text = extract_text(child);
+            let bold_text = bold_text.trim();
+            let label = "total time spent";
+            let Some(prefix) = bold_text.get(..label.len()) else {
+                continue;
+            };
+            if !prefix.eq_ignore_ascii_case(label) {
+                continue;
+            }
+            let suffix = bold_text[label.len()..].trim();
+            if !suffix.is_empty() && !suffix.starts_with(':') {
+                continue;
+            }
+            let after_bold = paragraph.children[index + 1..]
+                .iter()
+                .map(extract_text)
+                .collect::<String>();
+            let value = format!("{}{}", suffix.trim_start_matches(':'), after_bold);
+            let value = value.trim().trim_start_matches(':').trim();
+            return Ok(value.parse::<Span>()?);
+        }
+    }
+    Ok(Span::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use jiff::civil::date;
+
+    #[test]
+    fn parses_time_spent_from_each_entry_body() {
+        let input = "---\ntitle: Journal\ngithub_repo: example/repo\ndescription: Notes\ncreated_at: 2026-06-01\n---\n\n# 2026-06-08 - First\n\n**Total time spent:** 2h 30m\n\nOther **bold** text.\n\n# 2026-06-09 - Second\n\n**Total time spent**: 45m\n\n# 2026-06-10 - Third\n\nNo time recorded.\n";
+        let journal = Journal::parse(input).unwrap();
+        assert_eq!(
+            journal.entries[0].time_spent.fieldwise(),
+            "2h 30m".parse::<Span>().unwrap().fieldwise()
+        );
+        assert_eq!(
+            journal.entries[1].time_spent.fieldwise(),
+            "45m".parse::<Span>().unwrap().fieldwise()
+        );
+        assert_eq!(
+            journal.entries[2].time_spent.fieldwise(),
+            Span::new().fieldwise()
+        );
+        assert!(
+            nodes_to_markdown(&journal.entries[0].content)
+                .unwrap()
+                .contains("**Total time spent:** 2h 30m")
+        );
+    }
+
+    #[test]
+    fn parses_time_spent_inside_bold_text() {
+        let input = "---\ntitle: Journal\ngithub_repo: example/repo\ndescription: Notes\ncreated_at: 2026-06-01\n---\n\n# 2026-06-08 - First\n\n**Total time spent: 2h**\n";
+        let journal = Journal::parse(input).unwrap();
+        assert_eq!(
+            journal.entries[0].time_spent.fieldwise(),
+            "2h".parse::<Span>().unwrap().fieldwise()
+        );
+    }
+
+    #[test]
+    fn serializes_time_spent_without_duplicating_existing_content() {
+        let input = "---\ntitle: Journal\ngithub_repo: example/repo\ndescription: Notes\ncreated_at: 2026-06-01\n---\n\n# 2026-06-08 - First\n\nNote.\n";
+        let mut journal = Journal::parse(input).unwrap();
+        journal.entries[0].time_spent = "2h 30m".parse().unwrap();
+        let markdown = journal.journal_to_markdown().unwrap();
+        assert!(markdown.contains("**Total time spent: 2h 30m**"));
+        let reparsed = Journal::parse(&markdown).unwrap();
+        assert_eq!(
+            reparsed.entries[0].time_spent.fieldwise(),
+            journal.entries[0].time_spent.fieldwise()
+        );
+        assert_eq!(
+            reparsed
+                .journal_to_markdown()
+                .unwrap()
+                .matches("Total time spent")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_time_spent_fails_to_parse() {
+        let input = "---\ntitle: Journal\ngithub_repo: example/repo\ndescription: Notes\ncreated_at: 2026-06-01\n---\n\n# 2026-06-08 - First\n\n**Total time spent:** not a duration\n";
+        assert!(Journal::parse(input).is_err());
+    }
+
+    #[test]
+    fn parses_images_in_each_entry_body() {
+        let input = "---\ntitle: Journal\ngithub_repo: example/repo\ndescription: Notes\ncreated_at: 2026-06-01\n---\n\n# 2026-06-08 - First\n\n![diagram](https://example.com/diagram.png)\n\n- ![nested](https://example.com/nested.jpg)\n\n# 2026-06-09 - Second\n\n![screenshot](https://example.com/screenshot.png)\n";
+        let journal = Journal::parse(input).unwrap();
+        assert_eq!(journal.entries[0].images.len(), 2);
+        assert_eq!(journal.entries[0].images[0].alt_text, "diagram");
+        assert_eq!(
+            journal.entries[0].images[0].url.as_str(),
+            "https://example.com/diagram.png"
+        );
+        assert_eq!(journal.entries[0].images[1].alt_text, "nested");
+        assert_eq!(journal.entries[1].images.len(), 1);
+        assert_eq!(journal.entries[1].images[0].alt_text, "screenshot");
+    }
+
+    #[test]
+    fn relative_image_url_is_preserved() {
+        let input = "---\ntitle: Journal\ngithub_repo: example/repo\ndescription: Notes\ncreated_at: 2026-06-01\n---\n\n# 2026-06-08 - First\n\n![local](./image.png)\n";
+        let journal = Journal::parse(input).unwrap();
+        assert_eq!(journal.entries[0].images[0].url, "./image.png");
+        assert_eq!(
+            journal
+                .journal_to_markdown()
+                .unwrap()
+                .matches("![local]")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn parse_entries_preserves_mixed_markdown_bodies() {
